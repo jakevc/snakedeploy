@@ -31,9 +31,17 @@ from snakedeploy.utils import YamlDumper
 from snakedeploy.conda_version import VersionOrder
 
 
+class RattlerResult:
+    def __init__(self, success=True, stdout="", stderr=""):
+        self.success = success
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = 0 if success else 1
+
+
 def pin_conda_envs(
     conda_env_paths: list,
-    conda_frontend="mamba",
+    conda_frontend=None,  # Kept for backward compatibility but ignored
     create_prs=False,
     pr_add_label=False,
     entity_regex=None,
@@ -54,7 +62,7 @@ def pin_conda_envs(
 
 def update_conda_envs(
     conda_env_paths: list,
-    conda_frontend="mamba",
+    conda_frontend=None,  # Kept for backward compatibility but ignored
     create_prs=False,
     pin_envs=False,
     pr_add_label=False,
@@ -63,7 +71,7 @@ def update_conda_envs(
 ):
     """Update the given conda env definitions such that all dependencies
     in them are set to the latest feasible versions."""
-    return CondaEnvProcessor(conda_frontend=conda_frontend).process(
+    return CondaEnvProcessor().process(
         conda_env_paths,
         create_prs=create_prs,
         update_envs=True,
@@ -78,22 +86,13 @@ File = namedtuple("File", "path, content, is_updated, msg")
 
 
 class CondaEnvProcessor:
-    def __init__(self, conda_frontend="mamba"):
-        self.conda_frontend = conda_frontend
-        self.use_rattler = conda_frontend == "rattler"
+    def __init__(self, conda_frontend=None):
+        # conda_frontend parameter is kept for backward compatibility but ignored
+        self.conda_frontend = "rattler"  # Always use rattler
+        self.use_rattler = True
         
-        if self.use_rattler:
-            self.platform = Platform.current()
-            self.info = {"platform": str(self.platform).split("-")[0]}
-        else:
-            self.info = json.loads(
-                sp.check_output(
-                    f"{conda_frontend} info --json",
-                    universal_newlines=True,
-                    shell=True,
-                    stderr=sp.PIPE,
-                )
-            )
+        self.platform = Platform.current()
+        self.info = {"platform": str(self.platform).split("-")[0]}
 
     def process(
         self,
@@ -310,32 +309,15 @@ class CondaEnvProcessor:
             self.exec_conda(f"env remove --prefix {tmpdir} -y")
 
     def exec_conda(self, subcmd):
-        """Execute conda commands, either through subprocess or py-rattler API"""
-        if not self.use_rattler:
-            return sp.run(
-                f"{self.conda_frontend} {subcmd}",
-                shell=True,
-                stderr=sp.PIPE,
-                stdout=sp.PIPE,
-                universal_newlines=True,
-                check=True,
-            )
-        else:
-            result = self._exec_rattler(subcmd)
-            return result
+        """Execute conda commands through py-rattler API"""
+        result = self._exec_rattler(subcmd)
+        return result
             
     def _exec_rattler(self, subcmd):
         """Execute py-rattler API commands based on the subcommand"""
         parts = subcmd.strip().split()
         cmd = parts[0]
         args = parts[1:]
-        
-        class RattlerResult:
-            def __init__(self, success=True, stdout="", stderr=""):
-                self.success = success
-                self.stdout = stdout
-                self.stderr = stderr
-                self.returncode = 0 if success else 1
         
         if cmd == "env" and len(args) >= 1:
             subcmd = args[0]
@@ -357,13 +339,6 @@ class CondaEnvProcessor:
                 "platform": str(self.platform).split("-")[0],
                 "channels": ["conda-forge"],
             }
-            
-            class RattlerResult:
-                def __init__(self, success=True, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 0 if success else 1
             
             return RattlerResult(success=True, stdout=json.dumps(info))
         
@@ -420,22 +395,8 @@ class CondaEnvProcessor:
                 platforms=[self.platform]
             )
             
-            class RattlerResult:
-                def __init__(self, success=True, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 0 if success else 1
-            
             return RattlerResult(success=True)
         except Exception as e:
-            class RattlerResult:
-                def __init__(self, success=False, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 1
-            
             return RattlerResult(success=False, stderr=str(e))
     
     def _rattler_list_packages(self, args):
@@ -490,21 +451,7 @@ class CondaEnvProcessor:
                     with open(output_file, "w") as f:
                         f.write("\n".join(result))
                     
-                    class RattlerResult:
-                        def __init__(self, success=True, stdout="", stderr=""):
-                            self.success = success
-                            self.stdout = stdout
-                            self.stderr = stderr
-                            self.returncode = 0 if success else 1
-                    
                     return RattlerResult(success=True)
-                
-                class RattlerResult:
-                    def __init__(self, success=True, stdout="", stderr=""):
-                        self.success = success
-                        self.stdout = stdout
-                        self.stderr = stderr
-                        self.returncode = 0 if success else 1
                 
                 return RattlerResult(success=True, stdout="\n".join(result))
             
@@ -519,13 +466,6 @@ class CondaEnvProcessor:
                         "channel": record.channel
                     })
                 
-                class RattlerResult:
-                    def __init__(self, success=True, stdout="", stderr=""):
-                        self.success = success
-                        self.stdout = stdout
-                        self.stderr = stderr
-                        self.returncode = 0 if success else 1
-                
                 return RattlerResult(success=True, stdout=json.dumps(result))
             
             result = []
@@ -533,22 +473,8 @@ class CondaEnvProcessor:
                 record = RepoDataRecord.from_package(pkg)
                 result.append(f"{record.name} {record.version} {record.build_string}")
             
-            class RattlerResult:
-                def __init__(self, success=True, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 0 if success else 1
-            
             return RattlerResult(success=True, stdout="\n".join(result))
         except Exception as e:
-            class RattlerResult:
-                def __init__(self, success=False, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 1
-            
             return RattlerResult(success=False, stderr=str(e))
     
     def _rattler_remove_env(self, args):
@@ -574,22 +500,8 @@ class CondaEnvProcessor:
             if os.path.exists(prefix):
                 shutil.rmtree(prefix)
             
-            class RattlerResult:
-                def __init__(self, success=True, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 0 if success else 1
-            
             return RattlerResult(success=True)
         except Exception as e:
-            class RattlerResult:
-                def __init__(self, success=False, stdout="", stderr=""):
-                    self.success = success
-                    self.stdout = stdout
-                    self.stderr = stderr
-                    self.returncode = 1
-            
             return RattlerResult(success=False, stderr=str(e))
 
 
