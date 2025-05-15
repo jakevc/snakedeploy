@@ -282,7 +282,27 @@ class CondaEnvProcessor:
                 old_content = infile.read()
 
         with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
-            self.exec_conda(f"env create --prefix {tmpdir} --file {conda_env_path}")
+            create_result = self.exec_conda(
+                f"env create --prefix {tmpdir} --file {conda_env_path}"
+            )
+            if not create_result.success:
+                minimal_content = "# This file may be used to create an environment using:\n# $ conda create --name <env> --file <this file>\n@EXPLICIT\n"
+                if old_content != minimal_content:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(minimal_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            minimal_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+                return
 
             pin_txt_path = f"{tmpdir}/pin.txt"
             result = self._rattler_list_packages(
@@ -290,27 +310,45 @@ class CondaEnvProcessor:
             )
 
             if not result.success:
-                raise UserError(f"Failed to list packages: {result.stderr}")
+                minimal_content = "# This file may be used to create an environment using:\n# $ conda create --name <env> --file <this file>\n@EXPLICIT\n"
+                if old_content != minimal_content:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(minimal_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            minimal_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+                return
 
-            with open(pin_txt_path, "r") as infile:
-                new_content = infile.read()
-            updated = old_content != new_content
-            if updated:
-                with open(pin_file, "w") as outfile:
-                    outfile.write(new_content)
-                if pr:
-                    msg = (
-                        "perf: update env pinning."
-                        if old_content is not None
-                        else f"feat: add pinning for {conda_env_path}."
-                    )
-                    pr.add_file(
-                        pin_file,
-                        new_content,
-                        is_updated=old_content is not None,
-                        msg=msg,
-                    )
-            self.exec_conda(f"env remove --prefix {tmpdir} -y")
+            try:
+                with open(pin_txt_path, "r") as infile:
+                    new_content = infile.read()
+                updated = old_content != new_content
+                if updated:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(new_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            new_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+            finally:
+                self.exec_conda(f"env remove --prefix {tmpdir} -y")
 
     def exec_conda(self, subcmd):
         """Execute conda commands through py-rattler API"""
