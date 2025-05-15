@@ -431,6 +431,26 @@ class CondaEnvProcessor:
 
             packages = shell.installed_packages()
 
+            if not packages and explicit and md5:
+                result = ["# This file may be used to create an environment using:"]
+                result.append("# $ conda create --name <env> --file <this file>")
+                result.append("@EXPLICIT")
+
+                redirect_idx = -1
+                for i, arg in enumerate(args):
+                    if arg == ">":
+                        redirect_idx = i
+                        break
+
+                if redirect_idx >= 0 and redirect_idx + 1 < len(args):
+                    output_file = args[redirect_idx + 1]
+                    with open(output_file, "w") as f:
+                        f.write("\n".join(result))
+
+                    return RattlerResult(success=True)
+
+                return RattlerResult(success=True, stdout="\n".join(result))
+
             if explicit and md5:
                 result = ["# This file may be used to create an environment using:"]
                 result.append("# $ conda create --name <env> --file <this file>")
