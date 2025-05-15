@@ -128,12 +128,7 @@ def get_parser():
     pin_conda_envs.add_argument(
         "envfiles", nargs="+", help="Environment definition YAML files to pin."
     )
-    pin_conda_envs.add_argument(
-        "--conda-frontend",
-        choices=["mamba", "conda"],
-        default="conda",
-        help="Conda frontend to use.",
-    )
+
     pin_conda_envs.add_argument(
         "--create-prs",
         action="store_true",
@@ -169,12 +164,6 @@ def get_parser():
     )
     update_conda_envs.add_argument(
         "envfiles", nargs="+", help="Environment definition YAML files to update."
-    )
-    update_conda_envs.add_argument(
-        "--conda-frontend",
-        choices=["mamba", "conda"],
-        default="conda",
-        help="Conda frontend to use.",
     )
     update_conda_envs.add_argument(
         "--pin-envs",
@@ -275,7 +264,6 @@ def main():
         elif args.subcommand == "pin-conda-envs":
             pin_conda_envs(
                 args.envfiles,
-                conda_frontend=args.conda_frontend,
                 create_prs=args.create_prs,
                 entity_regex=args.entity_regex,
                 pr_add_label=args.pr_add_label,
@@ -284,7 +272,6 @@ def main():
         elif args.subcommand == "update-conda-envs":
             update_conda_envs(
                 args.envfiles,
-                conda_frontend=args.conda_frontend,
                 create_prs=args.create_prs,
                 pin_envs=args.pin_envs,
                 entity_regex=args.entity_regex,
