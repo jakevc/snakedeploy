@@ -199,12 +199,27 @@ class CondaEnvProcessor:
 
         def get_pkg_versions(conda_env_path):
             with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
-                self.exec_conda(f"env create --file {conda_env_path} --prefix {tmpdir}")
-                result = self.exec_conda(f"list --json --prefix {tmpdir}")
-                results = json.loads(result.stdout)
-                pkg_versions = {pkg["name"]: pkg["version"] for pkg in results}
-                self.exec_conda(f"env remove --prefix {tmpdir} -y")
-            return pkg_versions, results
+                create_result = self.exec_conda(
+                    f"env create --file {conda_env_path} --prefix {tmpdir}"
+                )
+                if not create_result.success:
+                    logger.warning(
+                        f"Failed to create environment: {create_result.stderr}"
+                    )
+                    return {}, []
+
+                try:
+                    result = self.exec_conda(f"list --json --prefix {tmpdir}")
+                    if not result.success:
+                        logger.warning(f"Failed to list packages: {result.stderr}")
+                        return {}, []
+
+                    results = json.loads(result.stdout)
+                    pkg_versions = {pkg["name"]: pkg["version"] for pkg in results}
+                    return pkg_versions, results
+                finally:
+                    self.exec_conda(f"env remove --prefix {tmpdir} -y")
+            return {}, []
 
         logger.info("Resolving prior versions...")
         prior_pkg_versions, _ = get_pkg_versions(conda_env_path)
