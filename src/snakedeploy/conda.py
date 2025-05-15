@@ -11,7 +11,6 @@ from itertools import chain
 import github
 from urllib3.util.retry import Retry
 import random
-import sys
 import shutil
 
 from packaging import version as packaging_version
@@ -22,7 +21,7 @@ from reretry import retry
 import rattler
 from rattler.platform import Platform
 from rattler.match_spec import MatchSpec
-from rattler.shell import Shell, ActivationVariables
+from rattler.shell import Shell
 from rattler.repo_data import RepoDataRecord
 
 from snakedeploy.exceptions import UserError
@@ -478,7 +477,6 @@ class CondaEnvProcessor:
     def _rattler_remove_env(self, args):
         """Remove a conda environment using py-rattler"""
         prefix = None
-        yes = False
 
         i = 0
         while i < len(args):
@@ -486,7 +484,6 @@ class CondaEnvProcessor:
                 prefix = args[i + 1]
                 i += 2
             elif args[i] == "-y":
-                yes = True
                 i += 1
             else:
                 i += 1
