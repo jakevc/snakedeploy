@@ -224,6 +224,10 @@ class CondaEnvProcessor:
         logger.info("Resolving prior versions...")
         prior_pkg_versions, _ = get_pkg_versions(conda_env_path)
 
+        if not prior_pkg_versions:
+            logger.warning(f"Could not resolve package versions for {conda_env_path}")
+            return False
+
         unconstrained_deps = process_dependencies(lambda name: name)
         unconstrained_env = dict(conda_env)
         unconstrained_env["dependencies"] = unconstrained_deps
@@ -235,6 +239,12 @@ class CondaEnvProcessor:
             logger.info("Resolving posterior versions...")
             posterior_pkg_versions, posterior_pkg_json = get_pkg_versions(tmpenv.name)
 
+            if not posterior_pkg_versions:
+                logger.warning(
+                    f"Could not resolve unconstrained package versions for {conda_env_path}"
+                )
+                return False
+
         def downgraded():
             downgraded_pkgs = []
             for pkg_name, version in posterior_pkg_versions.items():
@@ -242,9 +252,10 @@ class CondaEnvProcessor:
                     version = VersionOrder(version)
                 except packaging_version.InvalidVersion as e:
                     logger.debug(json.dumps(posterior_pkg_json, indent=2))
-                    raise UserError(
+                    logger.warning(
                         f"Cannot parse version {version} of package {pkg_name}: {e}"
                     )
+                    continue
                 prior_version = prior_pkg_versions.get(pkg_name)
                 if prior_version is not None and version < VersionOrder(prior_version):
                     downgraded_pkgs.append(pkg_name)
