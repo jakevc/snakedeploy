@@ -90,7 +90,7 @@ class CondaEnvProcessor:
         # conda_frontend parameter is kept for backward compatibility but ignored
         self.conda_frontend = "rattler"  # Always use rattler
         self.use_rattler = True
-        
+
         self.platform = Platform.current()
         self.info = {"platform": str(self.platform).split("-")[0]}
 
@@ -312,13 +312,13 @@ class CondaEnvProcessor:
         """Execute conda commands through py-rattler API"""
         result = self._exec_rattler(subcmd)
         return result
-            
+
     def _exec_rattler(self, subcmd):
         """Execute py-rattler API commands based on the subcommand"""
         parts = subcmd.strip().split()
         cmd = parts[0]
         args = parts[1:]
-        
+
         if cmd == "env" and len(args) >= 1:
             subcmd = args[0]
             if subcmd == "create":
@@ -329,9 +329,9 @@ class CondaEnvProcessor:
             return self._rattler_list_packages(args)
         elif cmd == "info":
             return self._rattler_info(args)
-        
+
         raise UserError(f"Unsupported rattler command: {subcmd}")
-        
+
     def _rattler_info(self, args):
         """Get conda info using py-rattler"""
         if "--json" in args:
@@ -339,16 +339,16 @@ class CondaEnvProcessor:
                 "platform": str(self.platform).split("-")[0],
                 "channels": ["conda-forge"],
             }
-            
+
             return RattlerResult(success=True, stdout=json.dumps(info))
-        
+
         raise UserError("Only --json format is supported for rattler info")
-        
+
     def _rattler_create_env(self, args):
         """Create a conda environment using py-rattler"""
         prefix = None
         env_file = None
-        
+
         i = 0
         while i < len(args):
             if args[i] == "--prefix" and i + 1 < len(args):
@@ -359,53 +359,49 @@ class CondaEnvProcessor:
                 i += 2
             else:
                 i += 1
-        
+
         if not prefix or not env_file:
             raise UserError("Missing required arguments for environment creation")
-        
+
         with open(env_file, "r") as f:
             env_config = yaml.safe_load(f)
-        
+
         # Extract dependencies
         dependencies = env_config.get("dependencies", [])
         specs = []
-        
+
         for dep in dependencies:
             if isinstance(dep, dict):
                 continue
             specs.append(MatchSpec(dep))
-        
+
         channels = env_config.get("channels", ["conda-forge"])
-        
+
         os.makedirs(prefix, exist_ok=True)
-        
+
         try:
             result = rattler.solve(
-                specs=specs,
-                platforms=[self.platform],
-                channels=channels
+                specs=specs, platforms=[self.platform], channels=channels
             )
-            
+
             if not result.success:
                 raise UserError(f"Could not solve environment: {result.error}")
-            
+
             rattler.install(
-                records=result.records,
-                prefix=prefix,
-                platforms=[self.platform]
+                records=result.records, prefix=prefix, platforms=[self.platform]
             )
-            
+
             return RattlerResult(success=True)
         except Exception as e:
             return RattlerResult(success=False, stderr=str(e))
-    
+
     def _rattler_list_packages(self, args):
         """List packages in a conda environment using py-rattler"""
         prefix = None
         output_json = False
         explicit = False
         md5 = False
-        
+
         i = 0
         while i < len(args):
             if args[i] == "--prefix" and i + 1 < len(args):
@@ -422,66 +418,68 @@ class CondaEnvProcessor:
                 i += 1
             else:
                 i += 1
-        
+
         if not prefix:
             raise UserError("Missing prefix for listing packages")
-        
+
         try:
             shell = Shell(prefix=prefix)
-            
+
             packages = shell.installed_packages()
-            
+
             if explicit and md5:
                 result = ["# This file may be used to create an environment using:"]
                 result.append("# $ conda create --name <env> --file <this file>")
                 result.append("@EXPLICIT")
-                
+
                 for pkg in packages:
                     record = RepoDataRecord.from_package(pkg)
                     result.append(f"{record.url}#{record.md5}")
-                
+
                 redirect_idx = -1
                 for i, arg in enumerate(args):
                     if arg == ">":
                         redirect_idx = i
                         break
-                
+
                 if redirect_idx >= 0 and redirect_idx + 1 < len(args):
                     output_file = args[redirect_idx + 1]
                     with open(output_file, "w") as f:
                         f.write("\n".join(result))
-                    
+
                     return RattlerResult(success=True)
-                
+
                 return RattlerResult(success=True, stdout="\n".join(result))
-            
+
             if output_json:
                 result = []
                 for pkg in packages:
                     record = RepoDataRecord.from_package(pkg)
-                    result.append({
-                        "name": record.name,
-                        "version": record.version,
-                        "build": record.build_string,
-                        "channel": record.channel
-                    })
-                
+                    result.append(
+                        {
+                            "name": record.name,
+                            "version": record.version,
+                            "build": record.build_string,
+                            "channel": record.channel,
+                        }
+                    )
+
                 return RattlerResult(success=True, stdout=json.dumps(result))
-            
+
             result = []
             for pkg in packages:
                 record = RepoDataRecord.from_package(pkg)
                 result.append(f"{record.name} {record.version} {record.build_string}")
-            
+
             return RattlerResult(success=True, stdout="\n".join(result))
         except Exception as e:
             return RattlerResult(success=False, stderr=str(e))
-    
+
     def _rattler_remove_env(self, args):
         """Remove a conda environment using py-rattler"""
         prefix = None
         yes = False
-        
+
         i = 0
         while i < len(args):
             if args[i] == "--prefix" and i + 1 < len(args):
@@ -492,14 +490,14 @@ class CondaEnvProcessor:
                 i += 1
             else:
                 i += 1
-        
+
         if not prefix:
             raise UserError("Missing prefix for environment removal")
-        
+
         try:
             if os.path.exists(prefix):
                 shutil.rmtree(prefix)
-            
+
             return RattlerResult(success=True)
         except Exception as e:
             return RattlerResult(success=False, stderr=str(e))
