@@ -283,10 +283,16 @@ class CondaEnvProcessor:
 
         with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
             self.exec_conda(f"env create --prefix {tmpdir} --file {conda_env_path}")
-            self.exec_conda(
-                f"list --explicit --md5 --prefix {tmpdir} > {tmpdir}/pin.txt"
+
+            pin_txt_path = f"{tmpdir}/pin.txt"
+            result = self._rattler_list_packages(
+                ["--explicit", "--md5", "--prefix", tmpdir, ">", pin_txt_path]
             )
-            with open(f"{tmpdir}/pin.txt", "r") as infile:
+
+            if not result.success:
+                raise UserError(f"Failed to list packages: {result.stderr}")
+
+            with open(pin_txt_path, "r") as infile:
                 new_content = infile.read()
             updated = old_content != new_content
             if updated:
