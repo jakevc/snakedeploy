@@ -11,11 +11,19 @@ from itertools import chain
 import github
 from urllib3.util.retry import Retry
 import random
+import sys
+import shutil
 
 from packaging import version as packaging_version
 import yaml
 from github import Github, GithubException
 from reretry import retry
+
+import rattler
+from rattler.platform import Platform
+from rattler.match_spec import MatchSpec
+from rattler.shell import Shell, ActivationVariables
+from rattler.repo_data import RepoDataRecord
 
 from snakedeploy.exceptions import UserError
 from snakedeploy.logger import logger
@@ -72,14 +80,20 @@ File = namedtuple("File", "path, content, is_updated, msg")
 class CondaEnvProcessor:
     def __init__(self, conda_frontend="mamba"):
         self.conda_frontend = conda_frontend
-        self.info = json.loads(
-            sp.check_output(
-                f"{conda_frontend} info --json",
-                universal_newlines=True,
-                shell=True,
-                stderr=sp.PIPE,
+        self.use_rattler = conda_frontend == "rattler"
+        
+        if self.use_rattler:
+            self.platform = Platform.current()
+            self.info = {"platform": str(self.platform).split("-")[0]}
+        else:
+            self.info = json.loads(
+                sp.check_output(
+                    f"{conda_frontend} info --json",
+                    universal_newlines=True,
+                    shell=True,
+                    stderr=sp.PIPE,
+                )
             )
-        )
 
     def process(
         self,
@@ -189,9 +203,8 @@ class CondaEnvProcessor:
         def get_pkg_versions(conda_env_path):
             with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
                 self.exec_conda(f"env create --file {conda_env_path} --prefix {tmpdir}")
-                results = json.loads(
-                    self.exec_conda(f"list --json --prefix {tmpdir}").stdout
-                )
+                result = self.exec_conda(f"list --json --prefix {tmpdir}")
+                results = json.loads(result.stdout)
                 pkg_versions = {pkg["name"]: pkg["version"] for pkg in results}
                 self.exec_conda(f"env remove --prefix {tmpdir} -y")
             return pkg_versions, results
@@ -211,6 +224,7 @@ class CondaEnvProcessor:
             posterior_pkg_versions, posterior_pkg_json = get_pkg_versions(tmpenv.name)
 
         def downgraded():
+            downgraded_pkgs = []
             for pkg_name, version in posterior_pkg_versions.items():
                 try:
                     version = VersionOrder(version)
@@ -221,13 +235,14 @@ class CondaEnvProcessor:
                     )
                 prior_version = prior_pkg_versions.get(pkg_name)
                 if prior_version is not None and version < VersionOrder(prior_version):
-                    yield pkg_name
+                    downgraded_pkgs.append(pkg_name)
+            return downgraded_pkgs
 
-        downgraded = set(unconstrained_deps) & set(downgraded())
-        if downgraded:
+        downgraded_pkgs = set(unconstrained_deps) & set(downgraded())
+        if downgraded_pkgs:
             msg = (
                 f"Env {conda_env_path} could not be updated because the following packages "
-                f"would be downgraded: {', '.join(downgraded)}. Please consider a manual update "
+                f"would be downgraded: {', '.join(downgraded_pkgs)}. Please consider a manual update "
                 "of the environment."
             )
             if warn_on_error:
@@ -295,14 +310,287 @@ class CondaEnvProcessor:
             self.exec_conda(f"env remove --prefix {tmpdir} -y")
 
     def exec_conda(self, subcmd):
-        return sp.run(
-            f"{self.conda_frontend} {subcmd}",
-            shell=True,
-            stderr=sp.PIPE,
-            stdout=sp.PIPE,
-            universal_newlines=True,
-            check=True,
-        )
+        """Execute conda commands, either through subprocess or py-rattler API"""
+        if not self.use_rattler:
+            return sp.run(
+                f"{self.conda_frontend} {subcmd}",
+                shell=True,
+                stderr=sp.PIPE,
+                stdout=sp.PIPE,
+                universal_newlines=True,
+                check=True,
+            )
+        else:
+            result = self._exec_rattler(subcmd)
+            return result
+            
+    def _exec_rattler(self, subcmd):
+        """Execute py-rattler API commands based on the subcommand"""
+        parts = subcmd.strip().split()
+        cmd = parts[0]
+        args = parts[1:]
+        
+        class RattlerResult:
+            def __init__(self, success=True, stdout="", stderr=""):
+                self.success = success
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = 0 if success else 1
+        
+        if cmd == "env" and len(args) >= 1:
+            subcmd = args[0]
+            if subcmd == "create":
+                return self._rattler_create_env(args[1:])
+            elif subcmd == "remove":
+                return self._rattler_remove_env(args[1:])
+        elif cmd == "list":
+            return self._rattler_list_packages(args)
+        elif cmd == "info":
+            return self._rattler_info(args)
+        
+        raise UserError(f"Unsupported rattler command: {subcmd}")
+        
+    def _rattler_info(self, args):
+        """Get conda info using py-rattler"""
+        if "--json" in args:
+            info = {
+                "platform": str(self.platform).split("-")[0],
+                "channels": ["conda-forge"],
+            }
+            
+            class RattlerResult:
+                def __init__(self, success=True, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 0 if success else 1
+            
+            return RattlerResult(success=True, stdout=json.dumps(info))
+        
+        raise UserError("Only --json format is supported for rattler info")
+        
+    def _rattler_create_env(self, args):
+        """Create a conda environment using py-rattler"""
+        prefix = None
+        env_file = None
+        
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "--file" and i + 1 < len(args):
+                env_file = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        
+        if not prefix or not env_file:
+            raise UserError("Missing required arguments for environment creation")
+        
+        with open(env_file, "r") as f:
+            env_config = yaml.safe_load(f)
+        
+        # Extract dependencies
+        dependencies = env_config.get("dependencies", [])
+        specs = []
+        
+        for dep in dependencies:
+            if isinstance(dep, dict):
+                continue
+            specs.append(MatchSpec(dep))
+        
+        channels = env_config.get("channels", ["conda-forge"])
+        
+        os.makedirs(prefix, exist_ok=True)
+        
+        try:
+            result = rattler.solve(
+                specs=specs,
+                platforms=[self.platform],
+                channels=channels
+            )
+            
+            if not result.success:
+                raise UserError(f"Could not solve environment: {result.error}")
+            
+            rattler.install(
+                records=result.records,
+                prefix=prefix,
+                platforms=[self.platform]
+            )
+            
+            class RattlerResult:
+                def __init__(self, success=True, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 0 if success else 1
+            
+            return RattlerResult(success=True)
+        except Exception as e:
+            class RattlerResult:
+                def __init__(self, success=False, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 1
+            
+            return RattlerResult(success=False, stderr=str(e))
+    
+    def _rattler_list_packages(self, args):
+        """List packages in a conda environment using py-rattler"""
+        prefix = None
+        output_json = False
+        explicit = False
+        md5 = False
+        
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "--json":
+                output_json = True
+                i += 1
+            elif args[i] == "--explicit":
+                explicit = True
+                i += 1
+            elif args[i] == "--md5":
+                md5 = True
+                i += 1
+            else:
+                i += 1
+        
+        if not prefix:
+            raise UserError("Missing prefix for listing packages")
+        
+        try:
+            shell = Shell(prefix=prefix)
+            
+            packages = shell.installed_packages()
+            
+            if explicit and md5:
+                result = ["# This file may be used to create an environment using:"]
+                result.append("# $ conda create --name <env> --file <this file>")
+                result.append("@EXPLICIT")
+                
+                for pkg in packages:
+                    record = RepoDataRecord.from_package(pkg)
+                    result.append(f"{record.url}#{record.md5}")
+                
+                redirect_idx = -1
+                for i, arg in enumerate(args):
+                    if arg == ">":
+                        redirect_idx = i
+                        break
+                
+                if redirect_idx >= 0 and redirect_idx + 1 < len(args):
+                    output_file = args[redirect_idx + 1]
+                    with open(output_file, "w") as f:
+                        f.write("\n".join(result))
+                    
+                    class RattlerResult:
+                        def __init__(self, success=True, stdout="", stderr=""):
+                            self.success = success
+                            self.stdout = stdout
+                            self.stderr = stderr
+                            self.returncode = 0 if success else 1
+                    
+                    return RattlerResult(success=True)
+                
+                class RattlerResult:
+                    def __init__(self, success=True, stdout="", stderr=""):
+                        self.success = success
+                        self.stdout = stdout
+                        self.stderr = stderr
+                        self.returncode = 0 if success else 1
+                
+                return RattlerResult(success=True, stdout="\n".join(result))
+            
+            if output_json:
+                result = []
+                for pkg in packages:
+                    record = RepoDataRecord.from_package(pkg)
+                    result.append({
+                        "name": record.name,
+                        "version": record.version,
+                        "build": record.build_string,
+                        "channel": record.channel
+                    })
+                
+                class RattlerResult:
+                    def __init__(self, success=True, stdout="", stderr=""):
+                        self.success = success
+                        self.stdout = stdout
+                        self.stderr = stderr
+                        self.returncode = 0 if success else 1
+                
+                return RattlerResult(success=True, stdout=json.dumps(result))
+            
+            result = []
+            for pkg in packages:
+                record = RepoDataRecord.from_package(pkg)
+                result.append(f"{record.name} {record.version} {record.build_string}")
+            
+            class RattlerResult:
+                def __init__(self, success=True, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 0 if success else 1
+            
+            return RattlerResult(success=True, stdout="\n".join(result))
+        except Exception as e:
+            class RattlerResult:
+                def __init__(self, success=False, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 1
+            
+            return RattlerResult(success=False, stderr=str(e))
+    
+    def _rattler_remove_env(self, args):
+        """Remove a conda environment using py-rattler"""
+        prefix = None
+        yes = False
+        
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "-y":
+                yes = True
+                i += 1
+            else:
+                i += 1
+        
+        if not prefix:
+            raise UserError("Missing prefix for environment removal")
+        
+        try:
+            if os.path.exists(prefix):
+                shutil.rmtree(prefix)
+            
+            class RattlerResult:
+                def __init__(self, success=True, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 0 if success else 1
+            
+            return RattlerResult(success=True)
+        except Exception as e:
+            class RattlerResult:
+                def __init__(self, success=False, stdout="", stderr=""):
+                    self.success = success
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = 1
+            
+            return RattlerResult(success=False, stderr=str(e))
 
 
 class PR:

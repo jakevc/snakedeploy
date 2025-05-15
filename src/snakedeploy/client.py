@@ -130,7 +130,7 @@ def get_parser():
     )
     pin_conda_envs.add_argument(
         "--conda-frontend",
-        choices=["mamba", "conda"],
+        choices=["mamba", "conda", "rattler"],
         default="conda",
         help="Conda frontend to use.",
     )
@@ -172,7 +172,7 @@ def get_parser():
     )
     update_conda_envs.add_argument(
         "--conda-frontend",
-        choices=["mamba", "conda"],
+        choices=["mamba", "conda", "rattler"],
         default="conda",
         help="Conda frontend to use.",
     )
