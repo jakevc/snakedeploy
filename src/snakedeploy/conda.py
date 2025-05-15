@@ -48,7 +48,7 @@ def pin_conda_envs(
 ):
     """Pin given conda envs by creating <conda-env>.<platform>.pin.txt
     files with explicit URLs for all packages in each env."""
-    return CondaEnvProcessor(conda_frontend=conda_frontend).process(
+    return CondaEnvProcessor().process(
         conda_env_paths,
         update_envs=False,
         pin_envs=True,
@@ -88,7 +88,6 @@ class CondaEnvProcessor:
     def __init__(self, conda_frontend=None):
         # conda_frontend parameter is kept for backward compatibility but ignored
         self.conda_frontend = "rattler"  # Always use rattler
-        self.use_rattler = True
 
         self.platform = Platform.current()
         self.info = {"platform": str(self.platform).split("-")[0]}
