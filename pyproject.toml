@@ -38,6 +38,7 @@ dependencies = [
     "packaging",
     "reretry",
     "setuptools",
+    "py-rattler>=0.5.0",
 ]
 
 [project.optional-dependencies]
