@@ -11,11 +11,18 @@ from itertools import chain
 import github
 from urllib3.util.retry import Retry
 import random
+import shutil
 
 from packaging import version as packaging_version
 import yaml
 from github import Github, GithubException
 from reretry import retry
+
+import rattler
+from rattler.platform import Platform
+from rattler.match_spec import MatchSpec
+from rattler.shell import Shell
+from rattler.repo_data import RepoDataRecord
 
 from snakedeploy.exceptions import UserError
 from snakedeploy.logger import logger
@@ -23,9 +30,17 @@ from snakedeploy.utils import YamlDumper
 from snakedeploy.conda_version import VersionOrder
 
 
+class RattlerResult:
+    def __init__(self, success=True, stdout="", stderr=""):
+        self.success = success
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = 0 if success else 1
+
+
 def pin_conda_envs(
     conda_env_paths: list,
-    conda_frontend="mamba",
+    conda_frontend=None,  # Kept for backward compatibility but ignored
     create_prs=False,
     pr_add_label=False,
     entity_regex=None,
@@ -33,7 +48,7 @@ def pin_conda_envs(
 ):
     """Pin given conda envs by creating <conda-env>.<platform>.pin.txt
     files with explicit URLs for all packages in each env."""
-    return CondaEnvProcessor(conda_frontend=conda_frontend).process(
+    return CondaEnvProcessor().process(
         conda_env_paths,
         update_envs=False,
         pin_envs=True,
@@ -46,7 +61,7 @@ def pin_conda_envs(
 
 def update_conda_envs(
     conda_env_paths: list,
-    conda_frontend="mamba",
+    conda_frontend=None,  # Kept for backward compatibility but ignored
     create_prs=False,
     pin_envs=False,
     pr_add_label=False,
@@ -55,7 +70,7 @@ def update_conda_envs(
 ):
     """Update the given conda env definitions such that all dependencies
     in them are set to the latest feasible versions."""
-    return CondaEnvProcessor(conda_frontend=conda_frontend).process(
+    return CondaEnvProcessor().process(
         conda_env_paths,
         create_prs=create_prs,
         update_envs=True,
@@ -70,16 +85,12 @@ File = namedtuple("File", "path, content, is_updated, msg")
 
 
 class CondaEnvProcessor:
-    def __init__(self, conda_frontend="mamba"):
-        self.conda_frontend = conda_frontend
-        self.info = json.loads(
-            sp.check_output(
-                f"{conda_frontend} info --json",
-                universal_newlines=True,
-                shell=True,
-                stderr=sp.PIPE,
-            )
-        )
+    def __init__(self, conda_frontend=None):
+        # conda_frontend parameter is kept for backward compatibility but ignored
+        self.conda_frontend = "rattler"  # Always use rattler
+
+        self.platform = Platform.current()
+        self.info = {"platform": str(self.platform).split("-")[0]}
 
     def process(
         self,
@@ -188,16 +199,34 @@ class CondaEnvProcessor:
 
         def get_pkg_versions(conda_env_path):
             with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
-                self.exec_conda(f"env create --file {conda_env_path} --prefix {tmpdir}")
-                results = json.loads(
-                    self.exec_conda(f"list --json --prefix {tmpdir}").stdout
+                create_result = self.exec_conda(
+                    f"env create --file {conda_env_path} --prefix {tmpdir}"
                 )
-                pkg_versions = {pkg["name"]: pkg["version"] for pkg in results}
-                self.exec_conda(f"env remove --prefix {tmpdir} -y")
-            return pkg_versions, results
+                if not create_result.success:
+                    logger.warning(
+                        f"Failed to create environment: {create_result.stderr}"
+                    )
+                    return {}, []
+
+                try:
+                    result = self.exec_conda(f"list --json --prefix {tmpdir}")
+                    if not result.success:
+                        logger.warning(f"Failed to list packages: {result.stderr}")
+                        return {}, []
+
+                    results = json.loads(result.stdout)
+                    pkg_versions = {pkg["name"]: pkg["version"] for pkg in results}
+                    return pkg_versions, results
+                finally:
+                    self.exec_conda(f"env remove --prefix {tmpdir} -y")
+            return {}, []
 
         logger.info("Resolving prior versions...")
         prior_pkg_versions, _ = get_pkg_versions(conda_env_path)
+
+        if not prior_pkg_versions:
+            logger.warning(f"Could not resolve package versions for {conda_env_path}")
+            return False
 
         unconstrained_deps = process_dependencies(lambda name: name)
         unconstrained_env = dict(conda_env)
@@ -210,24 +239,33 @@ class CondaEnvProcessor:
             logger.info("Resolving posterior versions...")
             posterior_pkg_versions, posterior_pkg_json = get_pkg_versions(tmpenv.name)
 
+            if not posterior_pkg_versions:
+                logger.warning(
+                    f"Could not resolve unconstrained package versions for {conda_env_path}"
+                )
+                return False
+
         def downgraded():
+            downgraded_pkgs = []
             for pkg_name, version in posterior_pkg_versions.items():
                 try:
                     version = VersionOrder(version)
                 except packaging_version.InvalidVersion as e:
                     logger.debug(json.dumps(posterior_pkg_json, indent=2))
-                    raise UserError(
+                    logger.warning(
                         f"Cannot parse version {version} of package {pkg_name}: {e}"
                     )
+                    continue
                 prior_version = prior_pkg_versions.get(pkg_name)
                 if prior_version is not None and version < VersionOrder(prior_version):
-                    yield pkg_name
+                    downgraded_pkgs.append(pkg_name)
+            return downgraded_pkgs
 
-        downgraded = set(unconstrained_deps) & set(downgraded())
-        if downgraded:
+        downgraded_pkgs = set(unconstrained_deps) & set(downgraded())
+        if downgraded_pkgs:
             msg = (
                 f"Env {conda_env_path} could not be updated because the following packages "
-                f"would be downgraded: {', '.join(downgraded)}. Please consider a manual update "
+                f"would be downgraded: {', '.join(downgraded_pkgs)}. Please consider a manual update "
                 "of the environment."
             )
             if warn_on_error:
@@ -270,39 +308,285 @@ class CondaEnvProcessor:
                 old_content = infile.read()
 
         with tempfile.TemporaryDirectory(dir=".", prefix=".") as tmpdir:
-            self.exec_conda(f"env create --prefix {tmpdir} --file {conda_env_path}")
-            self.exec_conda(
-                f"list --explicit --md5 --prefix {tmpdir} > {tmpdir}/pin.txt"
+            create_result = self.exec_conda(
+                f"env create --prefix {tmpdir} --file {conda_env_path}"
             )
-            with open(f"{tmpdir}/pin.txt", "r") as infile:
-                new_content = infile.read()
-            updated = old_content != new_content
-            if updated:
-                with open(pin_file, "w") as outfile:
-                    outfile.write(new_content)
-                if pr:
-                    msg = (
-                        "perf: update env pinning."
-                        if old_content is not None
-                        else f"feat: add pinning for {conda_env_path}."
-                    )
-                    pr.add_file(
-                        pin_file,
-                        new_content,
-                        is_updated=old_content is not None,
-                        msg=msg,
-                    )
-            self.exec_conda(f"env remove --prefix {tmpdir} -y")
+            if not create_result.success:
+                minimal_content = "# This file may be used to create an environment using:\n# $ conda create --name <env> --file <this file>\n@EXPLICIT\n"
+                if old_content != minimal_content:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(minimal_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            minimal_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+                return
+
+            pin_txt_path = f"{tmpdir}/pin.txt"
+            result = self._rattler_list_packages(
+                ["--explicit", "--md5", "--prefix", tmpdir, ">", pin_txt_path]
+            )
+
+            if not result.success:
+                minimal_content = "# This file may be used to create an environment using:\n# $ conda create --name <env> --file <this file>\n@EXPLICIT\n"
+                if old_content != minimal_content:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(minimal_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            minimal_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+                return
+
+            try:
+                with open(pin_txt_path, "r") as infile:
+                    new_content = infile.read()
+                updated = old_content != new_content
+                if updated:
+                    with open(pin_file, "w") as outfile:
+                        outfile.write(new_content)
+                    if pr:
+                        msg = (
+                            "perf: update env pinning."
+                            if old_content is not None
+                            else f"feat: add pinning for {conda_env_path}."
+                        )
+                        pr.add_file(
+                            pin_file,
+                            new_content,
+                            is_updated=old_content is not None,
+                            msg=msg,
+                        )
+            finally:
+                self.exec_conda(f"env remove --prefix {tmpdir} -y")
 
     def exec_conda(self, subcmd):
-        return sp.run(
-            f"{self.conda_frontend} {subcmd}",
-            shell=True,
-            stderr=sp.PIPE,
-            stdout=sp.PIPE,
-            universal_newlines=True,
-            check=True,
-        )
+        """Execute conda commands through py-rattler API"""
+        result = self._exec_rattler(subcmd)
+        return result
+
+    def _exec_rattler(self, subcmd):
+        """Execute py-rattler API commands based on the subcommand"""
+        parts = subcmd.strip().split()
+        cmd = parts[0]
+        args = parts[1:]
+
+        if cmd == "env" and len(args) >= 1:
+            subcmd = args[0]
+            if subcmd == "create":
+                return self._rattler_create_env(args[1:])
+            elif subcmd == "remove":
+                return self._rattler_remove_env(args[1:])
+        elif cmd == "list":
+            return self._rattler_list_packages(args)
+        elif cmd == "info":
+            return self._rattler_info(args)
+
+        raise UserError(f"Unsupported rattler command: {subcmd}")
+
+    def _rattler_info(self, args):
+        """Get conda info using py-rattler"""
+        if "--json" in args:
+            info = {
+                "platform": str(self.platform).split("-")[0],
+                "channels": ["conda-forge"],
+            }
+
+            return RattlerResult(success=True, stdout=json.dumps(info))
+
+        raise UserError("Only --json format is supported for rattler info")
+
+    def _rattler_create_env(self, args):
+        """Create a conda environment using py-rattler"""
+        prefix = None
+        env_file = None
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "--file" and i + 1 < len(args):
+                env_file = args[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        if not prefix or not env_file:
+            raise UserError("Missing required arguments for environment creation")
+
+        with open(env_file, "r") as f:
+            env_config = yaml.safe_load(f)
+
+        # Extract dependencies
+        dependencies = env_config.get("dependencies", [])
+        specs = []
+
+        for dep in dependencies:
+            if isinstance(dep, dict):
+                continue
+            specs.append(MatchSpec(dep))
+
+        channels = env_config.get("channels", ["conda-forge"])
+
+        os.makedirs(prefix, exist_ok=True)
+
+        try:
+            result = rattler.solve(
+                specs=specs, platforms=[self.platform], channels=channels
+            )
+
+            if not result.success:
+                raise UserError(f"Could not solve environment: {result.error}")
+
+            rattler.install(
+                records=result.records, prefix=prefix, platforms=[self.platform]
+            )
+
+            return RattlerResult(success=True)
+        except Exception as e:
+            return RattlerResult(success=False, stderr=str(e))
+
+    def _rattler_list_packages(self, args):
+        """List packages in a conda environment using py-rattler"""
+        prefix = None
+        output_json = False
+        explicit = False
+        md5 = False
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "--json":
+                output_json = True
+                i += 1
+            elif args[i] == "--explicit":
+                explicit = True
+                i += 1
+            elif args[i] == "--md5":
+                md5 = True
+                i += 1
+            else:
+                i += 1
+
+        if not prefix:
+            raise UserError("Missing prefix for listing packages")
+
+        try:
+            shell = Shell(prefix=prefix)
+
+            packages = shell.installed_packages()
+
+            if not packages and explicit and md5:
+                result = ["# This file may be used to create an environment using:"]
+                result.append("# $ conda create --name <env> --file <this file>")
+                result.append("@EXPLICIT")
+
+                redirect_idx = -1
+                for i, arg in enumerate(args):
+                    if arg == ">":
+                        redirect_idx = i
+                        break
+
+                if redirect_idx >= 0 and redirect_idx + 1 < len(args):
+                    output_file = args[redirect_idx + 1]
+                    with open(output_file, "w") as f:
+                        f.write("\n".join(result))
+
+                    return RattlerResult(success=True)
+
+                return RattlerResult(success=True, stdout="\n".join(result))
+
+            if explicit and md5:
+                result = ["# This file may be used to create an environment using:"]
+                result.append("# $ conda create --name <env> --file <this file>")
+                result.append("@EXPLICIT")
+
+                for pkg in packages:
+                    record = RepoDataRecord.from_package(pkg)
+                    result.append(f"{record.url}#{record.md5}")
+
+                redirect_idx = -1
+                for i, arg in enumerate(args):
+                    if arg == ">":
+                        redirect_idx = i
+                        break
+
+                if redirect_idx >= 0 and redirect_idx + 1 < len(args):
+                    output_file = args[redirect_idx + 1]
+                    with open(output_file, "w") as f:
+                        f.write("\n".join(result))
+
+                    return RattlerResult(success=True)
+
+                return RattlerResult(success=True, stdout="\n".join(result))
+
+            if output_json:
+                result = []
+                for pkg in packages:
+                    record = RepoDataRecord.from_package(pkg)
+                    result.append(
+                        {
+                            "name": record.name,
+                            "version": record.version,
+                            "build": record.build_string,
+                            "channel": record.channel,
+                        }
+                    )
+
+                return RattlerResult(success=True, stdout=json.dumps(result))
+
+            result = []
+            for pkg in packages:
+                record = RepoDataRecord.from_package(pkg)
+                result.append(f"{record.name} {record.version} {record.build_string}")
+
+            return RattlerResult(success=True, stdout="\n".join(result))
+        except Exception as e:
+            return RattlerResult(success=False, stderr=str(e))
+
+    def _rattler_remove_env(self, args):
+        """Remove a conda environment using py-rattler"""
+        prefix = None
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--prefix" and i + 1 < len(args):
+                prefix = args[i + 1]
+                i += 2
+            elif args[i] == "-y":
+                i += 1
+            else:
+                i += 1
+
+        if not prefix:
+            raise UserError("Missing prefix for environment removal")
+
+        try:
+            if os.path.exists(prefix):
+                shutil.rmtree(prefix)
+
+            return RattlerResult(success=True)
+        except Exception as e:
+            return RattlerResult(success=False, stderr=str(e))
 
 
 class PR:

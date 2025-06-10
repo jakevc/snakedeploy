@@ -66,11 +66,11 @@ runTest 0 $output grep "config.yml" ${dest}/workflow/Snakefile
 echo
 echo "#### Testing snakedeploy update-conda-envs"
 cp tests/test-env.yaml $tmpdir
-runTest 0 $output snakedeploy update-conda-envs --conda-frontend conda $tmpdir/test-env.yaml
+runTest 0 $output snakedeploy update-conda-envs $tmpdir/test-env.yaml
 
 echo
 echo "#### Testing snakedeploy pin-conda-envs"
-runTest 0 $output snakedeploy pin-conda-envs --conda-frontend conda $tmpdir/test-env.yaml
+runTest 0 $output snakedeploy pin-conda-envs $tmpdir/test-env.yaml
 
 echo
 echo "#### Testing snakedeploy update-snakemake-wrappers with given git ref"
